@@ -1,4 +1,5 @@
 use crate::partition::PartitionID;
+use io_utils::ConsistentBufReader;
 use std::{
     ffi::OsString,
     fmt::{self, Display, Formatter},
@@ -7,7 +8,12 @@ use std::{
     os::unix::prelude::OsStringExt,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Once,
 };
+
+/// Contains tools to interact with files, etc.
+mod io_utils;
+
 #[derive(Debug, Default, Clone, Hash, Eq, PartialEq)]
 pub struct MountInfo {
     pub source: PathBuf,
@@ -137,14 +143,14 @@ pub struct MountIter<R> {
     buffer: String,
 }
 
-impl MountIter<BufReader<File>> {
+impl MountIter<Box<dyn BufRead>> {
     pub fn new() -> io::Result<Self> {
         Self::new_from_file("/proc/mounts")
     }
 
     /// Read mounts from any mount-tab-like file.
     pub fn new_from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        Ok(Self::new_from_reader(BufReader::new(File::open(path)?)))
+        Ok(Self::new_from_reader(read_mount_info(path)?))
     }
 }
 
@@ -202,4 +208,51 @@ impl<R: BufRead> Iterator for MountIter<R> {
             }
         }
     }
+}
+
+/// This is the flag for the /proc/mounts linux bug. The bug has been fixed in
+/// commit 9f6c61f96f2d97 (v5.8+). This borrows the consistent read solution from
+/// k8s.io/mount-utils. Assumes bug exists by default, if version check fails.
+static mut KERNEL_HAS_MOUNT_INFO_BUG: bool = true;
+static INIT_KERNEL_HAS_MOUNT_INFO_BUG: Once = Once::new();
+/// Parses kernel version and returns true if version is less than 5.8.
+fn kernel_has_mount_info_bug() -> bool {
+    unsafe {
+        INIT_KERNEL_HAS_MOUNT_INFO_BUG.call_once(|| {
+            use nix::sys::utsname::uname;
+            use semver::Version;
+
+            // Bug was fixed in v5.8 with the commit 9f6c61f96f2d97.
+            const FIXED_VERSION: Version = Version::new(5, 8, 0);
+
+            let kernel_version_has_bug = || -> Result<bool, String> {
+                let uname = uname().map_err(|error| format!("failed uname: {}", error))?;
+
+                let release = uname
+                    .release()
+                    .to_str()
+                    .ok_or(format!("failed to convert {:?} to &str", uname.release()))?;
+                let version = Version::parse(release)
+                    .map_err(|e| format!("failed to parse version from {}: {}", release, e))?;
+
+                Ok(version.lt(&FIXED_VERSION))
+            };
+
+            // Assume bug exists by default.
+            KERNEL_HAS_MOUNT_INFO_BUG = kernel_version_has_bug().unwrap_or(true);
+        });
+        KERNEL_HAS_MOUNT_INFO_BUG
+    }
+}
+
+/// Returns a BufRead for the /proc/mounts file.
+fn read_mount_info<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>, io::Error> {
+    if kernel_has_mount_info_bug() {
+        return Ok(Box::new(
+            ConsistentBufReader::new(path.as_ref(), Some(6))
+                .map_err(|_| io::Error::from(ErrorKind::UnexpectedEof))?,
+        ));
+    }
+
+    Ok(Box::new(BufReader::new(File::open(path)?)))
 }
